@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# social-switch  (v2)
+# social-switch  (v2.1)
 # Block/unblock social media sites system-wide via /etc/hosts.
 #
 # Model: every platform is independently blocked or allowed. The list of
@@ -18,6 +18,9 @@
 #   social-switch on                   allow ALL platforms
 #   social-switch on a b               allow only a and b (others untouched)
 #   social-switch block|unblock a b    same as off|on, platforms required
+#   social-switch off URL...           block ANY site (e.g. example.com or https://example.com/page)
+#   social-switch on URL...            unblock a site you blocked that way
+#   social-switch sites                list custom (non-platform) sites  (no root)
 #   social-switch sync                 re-apply saved state to /etc/hosts
 #   social-switch doctor               diagnose problems            (no root)
 #
@@ -26,13 +29,14 @@
 
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 HOSTS="/etc/hosts"
 BACKUP="/etc/hosts.bak"
 IP4="0.0.0.0"
 IP6="::"
 CONFIG_DIR="/etc/social-switch"
 BLOCKED_FILE="$CONFIG_DIR/blocked"
+CUSTOM_FILE="$CONFIG_DIR/custom"           # one bare domain per line (custom sites)
 LEGACY_STATE_FILE="$CONFIG_DIR/state"      # v1, migrated automatically
 LEGACY_EXCLUDE_FILE="$CONFIG_DIR/exclude"  # v1, migrated automatically
 LOCK_FILE="/run/social-switch.lock"
@@ -168,10 +172,16 @@ is_valid_platform() {
     [[ "${1:-}" =~ ^[a-z0-9_-]+$ ]] && [ -n "${PLATFORM_LABEL[$1]+x}" ]
 }
 
+# Every hostname this tool may manage: built-in platforms + custom sites +
+# sites being unblocked right now (PURGE), so stray hand-made lines for them
+# get cleaned up too. Custom sites always come as "domain www.domain".
 all_domains() {
-    local key out=""
+    local key site out=""
     for key in "${PLATFORM_ORDER[@]}"; do
         out+="${PLATFORM_DOMAINS[$key]} "
+    done
+    for site in "${CUSTOM[@]}" "${PURGE[@]}"; do
+        out+="$site www.$site "
     done
     printf '%s' "$out"
 }
@@ -180,9 +190,47 @@ valid_keys_hint() {
     echo "Valid platforms: ${PLATFORM_ORDER[*]}" >&2
 }
 
+# normalize_host <url-or-host>  ->  prints the bare lowercase domain, or fails.
+#   https://User:pw@WWW.Example.com:8080/a/b?x=1#top  ->  example.com
+# The final regex is also the security gate: whatever passes it is safe to
+# write into /etc/hosts (no whitespace, newlines, '#', or IP literals). It
+# requires at least one dot, so "localhost" can never be blocked by accident.
+normalize_host() {
+    local h="${1,,}"
+    h="${h#"${h%%[![:space:]]*}"}"      # trim leading whitespace
+    h="${h%"${h##*[![:space:]]}"}"      # trim trailing whitespace
+    [[ "$h" != *[[:space:]]* ]] || return 1   # inner whitespace: refuse, don't guess
+    if [[ "$h" =~ ^[a-z][a-z0-9+.-]*:// ]]; then h="${h#*://}"; fi  # scheme
+    h="${h%%[/?#]*}"        # path, query, fragment
+    h="${h##*@}"            # user:pass@
+    h="${h%%:*}"            # :port
+    h="${h%.}"              # trailing dot of a fully-qualified name
+    h="${h#www.}"           # re-added as a second entry when the block is built
+    [ "${#h}" -le 253 ] || return 1
+    [[ "$h" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$ ]] || return 1
+    printf '%s' "$h"
+}
+
+# If a domain belongs to a built-in platform, print that platform's key.
+# Keeps "off instagram.com" and "off instagram" as ONE state, not two.
+platform_for_domain() {
+    local d="$1" key dom
+    for key in "${PLATFORM_ORDER[@]}"; do
+        for dom in ${PLATFORM_DOMAINS[$key]}; do
+            if [ "$dom" = "$d" ] || [ "$dom" = "www.$d" ]; then
+                printf '%s' "$key"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
 # --- saved state (the "blocked" list) ---------------------------------------
 
 BLOCKED=()
+CUSTOM=()     # custom sites wanted blocked (bare domains, no www.)
+PURGE=()      # custom sites being unblocked by the current command
 
 in_blocked() {
     in_list "$1" "${BLOCKED[@]}"
@@ -226,6 +274,47 @@ load_blocked() {
     return 0
 }
 
+set_custom_from() {
+    local s
+    CUSTOM=()
+    for s in "$@"; do
+        in_list "$s" "${CUSTOM[@]}" || CUSTOM+=("$s")
+    done
+    return 0
+}
+
+load_custom() {
+    CUSTOM=()
+    local line host
+    if [ -f "$CUSTOM_FILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Re-validate on every load: the file is root-owned, but never
+            # trust data that ends up inside /etc/hosts.
+            host="$(normalize_host "$line")" || continue
+            in_list "$host" "${CUSTOM[@]}" || CUSTOM+=("$host")
+        done < "$CUSTOM_FILE"
+    fi
+    return 0
+}
+
+load_state() {
+    load_blocked
+    load_custom
+}
+
+anything_blocked() {
+    [ "${#BLOCKED[@]}" -gt 0 ] || [ "${#CUSTOM[@]}" -gt 0 ]
+}
+
+save_custom() {
+    mkdir -p "$CONFIG_DIR"
+    if [ "${#CUSTOM[@]}" -gt 0 ]; then
+        printf '%s\n' "${CUSTOM[@]}" | atomic_write "$CUSTOM_FILE" 644
+    else
+        : | atomic_write "$CUSTOM_FILE" 644
+    fi
+}
+
 save_blocked() {
     mkdir -p "$CONFIG_DIR"
     if [ "${#BLOCKED[@]}" -gt 0 ]; then
@@ -267,7 +356,7 @@ hosts_markers_ok() {
 }
 
 managed_block() {
-    local key domain
+    local key domain site
     echo "$BEGIN_MARK"
     for key in "${BLOCKED[@]}"; do
         echo "# ${PLATFORM_LABEL[$key]}"
@@ -276,6 +365,15 @@ managed_block() {
             echo "$IP6 $domain"     # IPv6 too, so AAAA lookups can't leak
         done
     done
+    if [ "${#CUSTOM[@]}" -gt 0 ]; then
+        echo "# Custom sites"
+        for site in "${CUSTOM[@]}"; do
+            for domain in "$site" "www.$site"; do
+                echo "$IP4 $domain"
+                echo "$IP6 $domain"
+            done
+        done
+    fi
     echo "$END_MARK"
 }
 
@@ -304,7 +402,7 @@ build_hosts_content() {
             print
         }
     ' "$HOSTS"
-    if [ "${#BLOCKED[@]}" -gt 0 ]; then
+    if anything_blocked; then
         managed_block
     fi
 }
@@ -342,7 +440,7 @@ apply_hosts() {
     HOSTS_UNLOCKED=0
 
     # Lock only while something is blocked, so "on" leaves the file editable.
-    if [ "${#BLOCKED[@]}" -gt 0 ]; then
+    if anything_blocked; then
         chattr +i "$HOSTS" 2>/dev/null \
             || warn "could not set the immutable flag on $HOSTS (unsupported filesystem?)"
     fi
@@ -407,7 +505,7 @@ cmd_status() {
         *)      die "unknown option '$1' (usage: $PROG_NAME status [--json])" ;;
     esac
 
-    load_blocked
+    load_state
     load_active
 
     local key st sample count=0 total="${#PLATFORM_ORDER[@]}"
@@ -418,6 +516,19 @@ cmd_status() {
         if [ "$st" = blocked ]; then count=$((count + 1)); fi
     done
 
+    # Custom sites: blocked = both "domain" and "www.domain" are applied.
+    local site cst
+    local -A crows=()
+    for site in "${CUSTOM[@]}"; do
+        if [ -n "${ACTIVE[$site]+x}" ] && [ -n "${ACTIVE[www.$site]+x}" ]; then
+            crows[$site]="blocked"
+        else
+            crows[$site]="broken"
+        fi
+    done
+
+    # NOTE: overall/blocked_count/total describe the built-in platforms only,
+    # so existing consumers of --json (the bar widget) keep working unchanged.
     local overall="mixed"
     if [ "${#BLOCKED[@]}" -eq 0 ]; then overall="on"
     elif [ "${#BLOCKED[@]}" -eq "$total" ]; then overall="off"
@@ -437,6 +548,15 @@ cmd_status() {
             first=0
             printf '{"key":"%s","label":"%s","blocked":%s,"status":"%s"}' \
                 "$key" "${PLATFORM_LABEL[$key]}" "$isb" "${rows[$key]}"
+        done
+        printf '],"custom":['
+        first=1
+        for site in "${CUSTOM[@]}"; do
+            isb=false
+            if [ "${crows[$site]}" = blocked ]; then isb=true; fi
+            if [ "$first" -eq 0 ]; then printf ','; fi
+            first=0
+            printf '{"domain":"%s","blocked":%s,"status":"%s"}' "$site" "$isb" "${crows[$site]}"
         done
         printf ']}\n'
         return 0
@@ -466,7 +586,17 @@ cmd_status() {
     echo
     echo "$count / $total platforms currently blocked."
 
-    if [[ " ${rows[*]} " == *" broken "* ]]; then
+    if [ "${#CUSTOM[@]}" -gt 0 ]; then
+        echo
+        printf "%-30s %s\n" "CUSTOM SITE" "STATUS"
+        for site in "${CUSTOM[@]}"; do
+            cst="${crows[$site]}"
+            if [ "$cst" = blocked ]; then color="$C_RED"; else color="$C_YELLOW"; fi
+            printf "%-30s ${color}%s${C_RESET}\n" "$site" "$cst"
+        done
+    fi
+
+    if [[ " ${rows[*]} ${crows[*]} " == *" broken "* ]]; then
         echo "${C_YELLOW}broken${C_RESET}   = saved as blocked but missing from $HOSTS -> sudo $PROG_NAME sync"
     fi
     if [[ " ${rows[*]} " == *" external "* ]]; then
@@ -483,12 +613,25 @@ cmd_list() {
     done
 }
 
-# cmd_toggle <on|off> [platform...] [--except a,b]
+cmd_sites() {
+    load_custom
+    if [ "${#CUSTOM[@]}" -eq 0 ]; then
+        echo "No custom sites. Add one with: $PROG_NAME off example.com"
+        return 0
+    fi
+    echo "Custom sites (each also blocks its www. form):"
+    local site
+    for site in "${CUSTOM[@]}"; do
+        echo "  $site"
+    done
+}
+
+# cmd_toggle <on|off> [platform|URL...] [--except a,b]
 cmd_toggle() {
     local mode="$1"
     shift
-    local -a targets=() except=() parts=() next=()
-    local arg part key bulk=0
+    local -a targets=() sites=() except=() parts=() next=() next_sites=()
+    local arg part key host site bulk=0
 
     # 1. Parse and validate BEFORE asking for a password.
     while [ "$#" -gt 0 ]; do
@@ -510,6 +653,18 @@ cmd_toggle() {
             -*)
                 die "unknown option '$arg'"
                 ;;
+            *.*)
+                # Contains a dot -> a site/URL, not a platform key (keys never
+                # contain dots, so the two can't be confused). Not comma-split:
+                # commas are legal inside URL paths.
+                host="$(normalize_host "$arg")" \
+                    || die "'$arg' is not a valid site (expected e.g. example.com or https://example.com/page)"
+                if key="$(platform_for_domain "$host")"; then
+                    targets+=("$key")        # "instagram.com" == "instagram"
+                elif ! in_list "$host" "${sites[@]}"; then
+                    sites+=("$host")
+                fi
+                ;;
             *)
                 IFS=',' read -ra parts <<< "$arg"
                 for part in "${parts[@]}"; do
@@ -527,14 +682,15 @@ cmd_toggle() {
                 ;;
         esac
     done
-    if [ "${#targets[@]}" -gt 0 ] && [ "${#except[@]}" -gt 0 ]; then
-        die "--except can't be combined with explicit platforms"
+    if [ "$(( ${#targets[@]} + ${#sites[@]} ))" -gt 0 ] && [ "${#except[@]}" -gt 0 ]; then
+        die "--except can't be combined with explicit platforms or sites"
     fi
-    if [ "${#targets[@]}" -eq 0 ]; then bulk=1; fi
+    # Bulk = "everything" ONLY when the user named nothing at all.
+    if [ "$(( ${#targets[@]} + ${#sites[@]} ))" -eq 0 ]; then bulk=1; fi
 
     need_root
     acquire_lock
-    load_blocked
+    load_state
 
     # 2. Compute the new wanted-blocked set.
     if [ "$mode" = off ]; then
@@ -554,16 +710,43 @@ cmd_toggle() {
     fi
     set_blocked_from "${next[@]}"
 
+    # Custom sites are only ever touched by explicit URLs. Bulk on/off is about
+    # the built-in social platforms and leaves them alone.
+    if [ "${#sites[@]}" -gt 0 ]; then
+        if [ "$mode" = off ]; then
+            next_sites=("${CUSTOM[@]}" "${sites[@]}")
+        else
+            for site in "${CUSTOM[@]}"; do
+                in_list "$site" "${sites[@]}" || next_sites+=("$site")
+            done
+            PURGE=("${sites[@]}")   # also clean hand-made lines for these
+        fi
+        set_custom_from "${next_sites[@]}"
+    fi
+
     # 3. Persist the intent first, then apply it.
+    local -a named=("${targets[@]}" "${sites[@]}")
     if [ "$mode" = off ]; then
         if [ "$bulk" -eq 1 ]; then echo "Blocking social media..."
-        else echo "Blocking: ${targets[*]}"; fi
+        else echo "Blocking: ${named[*]}"; fi
     else
         if [ "$bulk" -eq 1 ]; then echo "Unblocking social media..."
-        else echo "Allowing: ${targets[*]}"; fi
+        else echo "Allowing: ${named[*]}"; fi
     fi
     save_blocked
+    save_custom
     apply_hosts
+
+    # An "on" can't remove entries it doesn't own (e.g. a shared blocklist line
+    # that also lists other hosts) - say so instead of silently "succeeding".
+    if [ "$mode" = on ] && [ "${#sites[@]}" -gt 0 ]; then
+        load_active
+        for site in "${sites[@]}"; do
+            if [ -n "${ACTIVE[$site]+x}" ] || [ -n "${ACTIVE[www.$site]+x}" ]; then
+                warn "$site is still blocked by another entry in $HOSTS (not managed by $PROG_NAME)."
+            fi
+        done
+    fi
 
     # 4. Report.
     local -a allowed=()
@@ -578,6 +761,9 @@ cmd_toggle() {
     if [ "${#allowed[@]}" -gt 0 ]; then
         echo "  ${C_GREEN}allowed:${C_RESET} ${allowed[*]}"
     fi
+    if [ "${#CUSTOM[@]}" -gt 0 ]; then
+        echo "  ${C_RED}custom:${C_RESET}  ${CUSTOM[*]}"
+    fi
     if [ "$mode" = off ]; then
         echo
         echo "${C_YELLOW}Note:${C_RESET} browsers using Secure DNS / DNS-over-HTTPS bypass $HOSTS."
@@ -589,8 +775,8 @@ cmd_toggle() {
 cmd_sync() {
     need_root
     acquire_lock
-    load_blocked
-    echo "Re-applying saved state (${#BLOCKED[@]} blocked platform(s))..."
+    load_state
+    echo "Re-applying saved state (${#BLOCKED[@]} platform(s), ${#CUSTOM[@]} custom site(s))..."
     apply_hosts
     echo "${C_BOLD}Done.${C_RESET}"
 }
@@ -634,7 +820,7 @@ cmd_doctor() {
     echo "===== Sanity checks ====="
     local issues=0 key sample ip
 
-    load_blocked
+    load_state
     load_active
 
     echo "-- Managed block markers:"
@@ -662,11 +848,11 @@ cmd_doctor() {
     fi
 
     echo "-- Immutable flag vs. saved state:"
-    if [ "${#BLOCKED[@]}" -eq 0 ] && is_immutable; then
+    if ! anything_blocked && is_immutable; then
         echo "  ${C_YELLOW}$HOSTS is locked but nothing is blocked (left over from an old version).${C_RESET}"
         echo "  Run: sudo $PROG_NAME on"
         issues=$((issues + 1))
-    elif [ "${#BLOCKED[@]}" -gt 0 ] && ! is_immutable; then
+    elif anything_blocked && ! is_immutable; then
         echo "  ${C_YELLOW}Blocking is active but $HOSTS is not locked (someone/something can rewrite it).${C_RESET}"
         echo "  Run: sudo $PROG_NAME sync"
         issues=$((issues + 1))
@@ -699,8 +885,16 @@ cmd_doctor() {
             problems=$((problems + 1))
         fi
     done
+    local site
+    for site in "${CUSTOM[@]}"; do
+        ip="$(timeout 3 getent ahostsv4 "$site" 2>/dev/null | awk 'NR==1 {print $1; exit}' || true)"
+        if [ "$ip" != "$IP4" ]; then
+            echo "  ${C_RED}$site should be blocked but resolves to ${ip:-nothing}${C_RESET}"
+            problems=$((problems + 1))
+        fi
+    done
     if [ "$problems" -eq 0 ]; then
-        echo "  all ${#PLATFORM_ORDER[@]} platforms resolve as expected"
+        echo "  all ${#PLATFORM_ORDER[@]} platforms and ${#CUSTOM[@]} custom site(s) resolve as expected"
     else
         issues=$((issues + problems))
     fi
@@ -730,6 +924,9 @@ Usage: $PROG_NAME <command> [args]
   on                           Allow ALL platforms                 (sudo)
   on <platform>...             Allow only these platforms          (sudo)
   block|unblock <platform>...  Same as off|on, platforms required  (sudo)
+  off <URL>...                 Block any site, e.g. example.com    (sudo)
+  on  <URL>...                 Unblock a site you blocked          (sudo)
+  sites                        List custom sites                   (no root)
   sync                         Re-apply saved state to /etc/hosts  (sudo)
   doctor                       Diagnose problems                   (no root)
   version                      Print version
@@ -741,6 +938,8 @@ Examples:
   $PROG_NAME off
   $PROG_NAME off --except discord,twitch
   $PROG_NAME off instagram tiktok
+  $PROG_NAME off https://news.ycombinator.com/item?id=1
+  $PROG_NAME on news.ycombinator.com
   $PROG_NAME on instagram
   $PROG_NAME status
 EOF
@@ -751,6 +950,7 @@ main() {
     case "$cmd" in
         status)   shift; cmd_status "$@" ;;
         list)     cmd_list ;;
+        sites)    cmd_sites ;;
         on|off)   shift; cmd_toggle "$cmd" "$@" ;;
         block)    shift; [ "$#" -ge 1 ] || die "usage: $PROG_NAME block <platform>..."; cmd_toggle off "$@" ;;
         unblock)  shift; [ "$#" -ge 1 ] || die "usage: $PROG_NAME unblock <platform>..."; cmd_toggle on "$@" ;;
@@ -763,7 +963,7 @@ main() {
         *)
             # Forgiving order: "social-switch instagram off" -> "off instagram"
             if [ "$#" -eq 2 ] && [[ "$2" == on || "$2" == off ]] \
-                && is_valid_platform "$(normalize_key "$1")"; then
+                && { is_valid_platform "$(normalize_key "$1")" || [[ "$1" == *.* ]]; }; then
                 cmd_toggle "$2" "$1"
             else
                 echo "Unknown command: $cmd" >&2
