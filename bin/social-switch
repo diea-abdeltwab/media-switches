@@ -517,7 +517,7 @@ cmd_status() {
     done
 
     # Custom sites: blocked = both "domain" and "www.domain" are applied.
-    local site cst
+    local site
     local -A crows=()
     for site in "${CUSTOM[@]}"; do
         if [ -n "${ACTIVE[$site]+x}" ] && [ -n "${ACTIVE[www.$site]+x}" ]; then
@@ -585,16 +585,6 @@ cmd_status() {
     done
     echo
     echo "$count / $total platforms currently blocked."
-
-    if [ "${#CUSTOM[@]}" -gt 0 ]; then
-        echo
-        printf "%-30s %s\n" "CUSTOM SITE" "STATUS"
-        for site in "${CUSTOM[@]}"; do
-            cst="${crows[$site]}"
-            if [ "$cst" = blocked ]; then color="$C_RED"; else color="$C_YELLOW"; fi
-            printf "%-30s ${color}%s${C_RESET}\n" "$site" "$cst"
-        done
-    fi
 
     if [[ " ${rows[*]} ${crows[*]} " == *" broken "* ]]; then
         echo "${C_YELLOW}broken${C_RESET}   = saved as blocked but missing from $HOSTS -> sudo $PROG_NAME sync"
