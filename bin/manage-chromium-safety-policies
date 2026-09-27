@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+#
+# manage-chromium-safety-policies.sh
+#
+# Installs, removes, or checks Chrome/Chromium "managed policies" for
+# content safety / family filtering, on any Chromium-based browser on
+# any Linux distro (Omarchy, Arch, Debian, Fedora, etc.).
+#
+# Two independent levels, so you can mix and match:
+#
+#   LEVEL_1  Content filtering (SafeSearch, YouTube restrict, explicit
+#            content blocking, keep DNS-level filters effective).
+#
+#   LEVEL_2  Anti-bypass hardening (blocks Incognito, Guest mode, new
+#            profiles, ALL extensions incl. VPN/proxy extensions,
+#            DevTools, history deletion, and locks the proxy to the
+#            system's, forces HTTPS).
+#
+# NOTE ON VPNs: Chrome policies only control the BROWSER. They can block
+# VPN/proxy *extensions* (covered by LEVEL_2's ExtensionInstallBlocklist)
+# and lock the browser's own proxy setting, but they CANNOT block a
+# standalone VPN *application* installed on the OS (e.g. a system-wide
+# WireGuard/OpenVPN client) - that traffic never goes through Chrome's
+# policy engine. Blocking that requires OS-level or firewall/network
+# controls, which is outside what a browser policy can do.
+#
+# Each level lives in its own file, so removing one never touches the
+# other (LEVEL_2 doesn't wipe out LEVEL_1, and vice versa).
+#
+# Usage:
+#   sudo ./manage-chromium-safety-policies.sh install LEVEL_1
+#   sudo ./manage-chromium-safety-policies.sh install LEVEL_2
+#   sudo ./manage-chromium-safety-policies.sh install ALL
+#   sudo ./manage-chromium-safety-policies.sh remove  LEVEL_1
+#   sudo ./manage-chromium-safety-policies.sh remove  LEVEL_2
+#   sudo ./manage-chromium-safety-policies.sh remove  ALL
+#   ./manage-chromium-safety-policies.sh status              # no sudo needed
+#
+# Edit the *_JSON variables below to tweak values.
+# Full policy reference: https://chromeenterprise.google/policies/
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# LEVEL 1 - Content filtering
+# ----------------------------------------------------------------------------
+#   ForceGoogleSafeSearch   -> forces SafeSearch on for Google Search.
+#   ForceYouTubeRestrict    -> 2 = "Strict" YouTube Restricted Mode.
+#   SafeSitesFilterBehavior -> 1 = BlockExplicitContent. Blocks pornographic
+#                              sites network-wide via Google's Safe Sites
+#                              classifier, regardless of search engine used.
+#   DnsOverHttpsMode        -> "off" keeps any DNS-level filter (router,
+#                              OpenDNS FamilyShield, etc.) effective, since
+#                              DoH would otherwise bypass it.
+#   BrowserColorScheme      -> "dark" (cosmetic only).
+LEVEL1_FILE="zzz-family-safety-level1-content-filter.json"
+read -r -d '' LEVEL1_JSON << 'EOF' || true
+{
+  "ForceGoogleSafeSearch": true,
+  "ForceYouTubeRestrict": 2,
+  "SafeSitesFilterBehavior": 1,
+  "DnsOverHttpsMode": "off",
+  "BrowserColorScheme": "dark"
+}
+EOF
+
+# ----------------------------------------------------------------------------
+# LEVEL 2 - Anti-bypass hardening
+# ----------------------------------------------------------------------------
+#   IncognitoModeAvailability -> 1 = Incognito disabled (filters usually
+#                                still apply there, but this closes the door).
+#   BrowserGuestModeEnabled   -> false = no Guest browsing session.
+#   BrowserAddPersonEnabled   -> false = can't create a new, unmanaged profile.
+#   ExtensionInstallBlocklist -> ["*"] = blocks installing ANY extension,
+#                                which covers VPN/proxy/unblocker extensions.
+#   ProxySettings             -> locks the browser to the system's proxy
+#                                config, so a manual/VPN-style proxy can't
+#                                be configured from inside the browser.
+#   DeveloperToolsAvailability-> 2 = DevTools completely disabled.
+#   AllowDeletingBrowserHistory -> false = history can't be cleared.
+#   HttpsOnlyMode             -> "force_enabled" = always upgrade to HTTPS.
+LEVEL2_FILE="zzz-family-safety-level2-hardening.json"
+read -r -d '' LEVEL2_JSON << 'EOF' || true
+{
+  "IncognitoModeAvailability": 1,
+  "BrowserGuestModeEnabled": false,
+  "BrowserAddPersonEnabled": false,
+  "ExtensionInstallBlocklist": ["*"],
+  "ProxySettings": { "ProxyMode": "system" },
+  "DeveloperToolsAvailability": 2,
+  "AllowDeletingBrowserHistory": false,
+  "HttpsOnlyMode": "force_enabled"
+}
+EOF
+
+# ----------------------------------------------------------------------------
+# LEGACY - filenames used before this script existed / before the
+# LEVEL_1/LEVEL_2 split. Kept here only so "remove ALL" and "status" can
+# find and clean them up.
+#
+# LEGACY_STANDALONE_FILES contain ONLY policies this script manages, so
+# they can be deleted outright.
+#
+# LEGACY_MIXED_FILE ("color.json") also contains BrowserThemeColor, which
+# belongs to Omarchy (or whatever theme tool set it) and is NOT ours to
+# touch. For that file we only strip out LEGACY_MIXED_KEY
+# (BrowserColorScheme) and leave everything else in the file untouched.
+# ----------------------------------------------------------------------------
+LEGACY_STANDALONE_FILES=(
+  "zzz-family-safety-policies.json"
+  "dns-family.json"
+  "safe-search.json"
+)
+LEGACY_MIXED_FILE="color.json"
+LEGACY_MIXED_KEY="BrowserColorScheme"
+
+# browser key -> "binary_to_detect:managed_policies_dir"
+declare -A BROWSERS=(
+  [chromium]="chromium:/etc/chromium/policies/managed"
+  [chromium-browser]="chromium-browser:/etc/chromium-browser/policies/managed"
+  [google-chrome]="google-chrome-stable:/etc/opt/chrome/policies/managed"
+  [google-chrome-beta]="google-chrome-beta:/etc/opt/chrome-beta/policies/managed"
+  [brave]="brave-browser:/etc/brave/policies/managed"
+  [vivaldi]="vivaldi-stable:/etc/vivaldi/policies/managed"
+  [microsoft-edge]="microsoft-edge-stable:/etc/opt/edge/policies/managed"
+)
+
+
+# Some setups (e.g. a theming tool re-applying config on every boot) mark
+# their managed policy files as immutable (chattr +i), which makes even
+# root's `rm`/write fail with "Operation not permitted". Clear that flag
+# before touching a file; a no-op (and silent) everywhere else.
+clear_immutable() {
+  local f="$1"
+  command -v chattr >/dev/null 2>&1 && chattr -i "$f" 2>/dev/null
+  return 0
+}
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "This command needs sudo: sudo $0 $*" >&2
+    exit 1
+  fi
+}
+
+usage() {
+  cat >&2 << USAGE
+Usage:
+  $0 install LEVEL_1
+  $0 install LEVEL_2
+  $0 install ALL
+  $0 remove  LEVEL_1
+  $0 remove  LEVEL_2
+  $0 remove  ALL
+  $0 status
+USAGE
+  exit 1
+}
+
+# Returns "key:dir" for every browser that looks installed on this machine.
+detect_installed() {
+  local found=0
+  for key in "${!BROWSERS[@]}"; do
+    IFS=':' read -r bin dir <<< "${BROWSERS[$key]}"
+    if command -v "$bin" >/dev/null 2>&1 || [ -d "$(dirname "$dir")" ]; then
+      echo "$key:$dir"
+      found=1
+    fi
+  done
+  [ "$found" -eq 0 ] && echo ""
+  return 0
+}
+
+file_and_json_for_level() {
+  case "$1" in
+    LEVEL_1) echo "$LEVEL1_FILE"; echo "$LEVEL1_JSON" ;;
+    LEVEL_2) echo "$LEVEL2_FILE"; echo "$LEVEL2_JSON" ;;
+    *) echo "Unknown level: $1 (expected LEVEL_1, LEVEL_2, or ALL)" >&2; exit 1 ;;
+  esac
+}
+
+install_level() {
+  local level="$1"
+  local file json any=0
+  file=$(file_and_json_for_level "$level" | sed -n 1p)
+  json=$(file_and_json_for_level "$level" | tail -n +2)
+
+  while IFS=':' read -r key dir; do
+    [ -z "$key" ] && continue
+    any=1
+    mkdir -p "$dir"
+    clear_immutable "$dir/$file"
+    printf '%s\n' "$json" > "$dir/$file"
+    chmod 644 "$dir/$file"
+    echo "[+] $level installed for $key -> $dir/$file"
+  done < <(detect_installed)
+
+  if [ "$any" -eq 0 ]; then
+    echo "No Chromium-based browser detected on this system." >&2
+    exit 1
+  fi
+}
+
+remove_level() {
+  local level="$1"
+  local file any=0
+  file=$(file_and_json_for_level "$level" | sed -n 1p)
+
+  for key in "${!BROWSERS[@]}"; do
+    IFS=':' read -r bin dir <<< "${BROWSERS[$key]}"
+    target="$dir/$file"
+    if [ -f "$target" ]; then
+      clear_immutable "$target"
+      rm -f "$target"
+      echo "[-] $level removed for $key -> $target"
+      any=1
+    fi
+  done
+
+  [ "$any" -eq 0 ] && echo "$level was not installed, nothing to remove."
+}
+
+# Strips LEGACY_MIXED_KEY out of a color.json-style file while preserving
+# every other key (e.g. BrowserThemeColor) untouched. Deletes the file only
+# if nothing else is left in it. Requires python3.
+strip_mixed_key() {
+  local target="$1"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[!] python3 not found - please remove \"$LEGACY_MIXED_KEY\" from $target by hand." >&2
+    return
+  fi
+  clear_immutable "$target"
+  python3 - "$target" "$LEGACY_MIXED_KEY" << 'PY'
+import json, sys
+path, key = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    data = json.load(f)
+removed = data.pop(key, None)
+if removed is None:
+    sys.exit(0)
+if data:
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    print(f"kept:{path}")
+else:
+    import os
+    os.remove(path)
+    print(f"deleted:{path}")
+PY
+}
+
+# Cleans up leftovers from before this script existed.
+remove_legacy() {
+  local any=0
+  for key in "${!BROWSERS[@]}"; do
+    IFS=':' read -r bin dir <<< "${BROWSERS[$key]}"
+
+    for fname in "${LEGACY_STANDALONE_FILES[@]}"; do
+      target="$dir/$fname"
+      if [ -f "$target" ]; then
+        clear_immutable "$target"
+        rm -f "$target"
+        echo "[-] LEGACY removed for $key -> $target"
+        any=1
+      fi
+    done
+
+    mixed="$dir/$LEGACY_MIXED_FILE"
+    if [ -f "$mixed" ] && grep -q "\"$LEGACY_MIXED_KEY\"" "$mixed" 2>/dev/null; then
+      result=$(strip_mixed_key "$mixed")
+      case "$result" in
+        kept:*)    echo "[-] LEGACY key \"$LEGACY_MIXED_KEY\" removed from $key -> $mixed (other keys kept, e.g. BrowserThemeColor)"; any=1 ;;
+        deleted:*) echo "[-] LEGACY removed for $key -> $mixed (file was empty afterwards)"; any=1 ;;
+      esac
+    fi
+  done
+  [ "$any" -eq 1 ] && echo "(These were leftovers from before this script existed.)"
+}
+
+cmd_install() {
+  local level="${1:-}"
+  [ -z "$level" ] && usage
+  need_root "install $level"
+  case "$level" in
+    ALL) install_level LEVEL_1; install_level LEVEL_2 ;;
+    LEVEL_1|LEVEL_2) install_level "$level" ;;
+    *) usage ;;
+  esac
+  echo
+  echo "Done. Open chrome://policy and click 'Reload policies' to confirm."
+}
+
+cmd_remove() {
+  local level="${1:-}"
+  [ -z "$level" ] && usage
+  need_root "remove $level"
+  case "$level" in
+    ALL) remove_level LEVEL_1; remove_level LEVEL_2; remove_legacy ;;
+    LEVEL_1|LEVEL_2) remove_level "$level" ;;
+    *) usage ;;
+  esac
+  echo
+  echo "Done. Open chrome://policy and click 'Reload policies' to confirm."
+}
+
+cmd_status() {
+  local any=0
+  for key in "${!BROWSERS[@]}"; do
+    IFS=':' read -r bin dir <<< "${BROWSERS[$key]}"
+    if ! command -v "$bin" >/dev/null 2>&1 && [ ! -d "$dir" ]; then
+      continue
+    fi
+    any=1
+    l1_status="not set"; [ -f "$dir/$LEVEL1_FILE" ] && l1_status="ENABLED"
+    l2_status="not set"; [ -f "$dir/$LEVEL2_FILE" ] && l2_status="ENABLED"
+    echo "$key:"
+    echo "  LEVEL_1 (content filter): $l1_status"
+    echo "  LEVEL_2 (hardening):      $l2_status"
+    for fname in "${LEGACY_STANDALONE_FILES[@]}"; do
+      if [ -f "$dir/$fname" ]; then
+        echo "  LEGACY file found:        $dir/$fname  - run 'remove ALL' to clean it up"
+      fi
+    done
+    mixed="$dir/$LEGACY_MIXED_FILE"
+    if [ -f "$mixed" ] && grep -q "\"$LEGACY_MIXED_KEY\"" "$mixed" 2>/dev/null; then
+      echo "  LEGACY key found:         \"$LEGACY_MIXED_KEY\" inside $mixed  - run 'remove ALL' to clean it up (BrowserThemeColor there is kept)"
+    fi
+  done
+  [ "$any" -eq 0 ] && echo "No Chromium-based browser detected on this system."
+}
+
+case "${1:-}" in
+  install) cmd_install "${2:-}" ;;
+  remove)  cmd_remove "${2:-}" ;;
+  status)  cmd_status ;;
+  *) usage ;;
+esac
