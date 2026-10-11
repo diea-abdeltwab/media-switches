@@ -2,7 +2,12 @@
 
 [![Typing SVG](https://readme-typing-svg.herokuapp.com/?font=Fira+Code&weight=600&size=20&duration=3000&pause=800&color=EDEDEC&background=00000000&center=true&vCenter=true&width=700&lines=social-switch+%E2%86%92+block+social+media+via+%2Fetc%2Fhosts;cloudflare-switch+%E2%86%92+Cloudflare+DNS+filter+on%2Foff;status+%C2%B7+on+%C2%B7+off.+That%27s+the+whole+interface.;One+file+each.+No+dependencies+beyond+Bash.)](https://git.io/typing-svg)
 
-[![Bash](https://img.shields.io/badge/Bash%20%E2%89%A5%204.4-4EAA25?style=for-the-badge&logo=gnu-bash&logoColor=white)](https://www.gnu.org/software/bash/) [![Linux](https://img.shields.io/badge/Any%20Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](#-requirements) [![DNS backends](https://img.shields.io/badge/NetworkManager%20%C2%B7%20systemd--resolved-4A86CF?style=for-the-badge&logo=linux&logoColor=white)](#️-cloudflare-switch) [![License](https://img.shields.io/badge/License-MIT-7A2E33?style=for-the-badge)](LICENSE)
+<p align="center">
+  <a href="https://www.gnu.org/software/bash/"><img src="https://img.shields.io/badge/Bash%20%E2%89%A5%204.4-4EAA25?style=for-the-badge&logo=gnu-bash&logoColor=white" alt="Bash"></a>
+  <a href="#-requirements"><img src="https://img.shields.io/badge/Any%20Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux"></a>
+  <a href="#️-cloudflare-switch"><img src="https://img.shields.io/badge/NetworkManager%20%C2%B7%20systemd--resolved-4A86CF?style=for-the-badge&logo=linux&logoColor=white" alt="DNS backends"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-7A2E33?style=for-the-badge" alt="License"></a>
+</p>
 
 ---
 
@@ -344,7 +349,11 @@ Released under the [MIT License](LICENSE).
 
 *Turning raw data into reliable systems — and, on the side, building the local-first tools I actually want to use.*
 
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/diea-abdeltwab/) [![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/diea-abdeltwab) [![Email](https://img.shields.io/badge/Email-D14836?style=for-the-badge&logo=gmail&logoColor=white)](mailto:dieaabdeltwab2024@gmail.com)
+<p align="center">
+  <a href="https://www.linkedin.com/in/diea-abdeltwab/"><img src="https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white" alt="LinkedIn"></a>
+  <a href="https://github.com/diea-abdeltwab"><img src="https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub"></a>
+  <a href="mailto:diea.abdeltwab@gmail.com"><img src="https://img.shields.io/badge/Email-D14836?style=for-the-badge&logo=gmail&logoColor=white" alt="Email"></a>
+</p>
 
 ⭐ **If either of these tools helps you stay focused, a star helps a lot!** ⭐
 
